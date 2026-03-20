@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timedelta
 import pytz
 import requests
+from bs4 import BeautifulSoup
 from flask import Flask, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 from playwright.sync_api import sync_playwright
@@ -17,35 +18,41 @@ def scrape_task():
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'http://play.sportsteam368.com/'
     }
 
-    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🚀 开始执行抓取任务(全局资源拦截模式)...")
+    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🚀 开始执行抓取任务(精确解析 + 底层抓包)...")
     
+    # 1. 获取主列表
     js_url = 'https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5'
     try:
         response = requests.get(js_url, headers=headers, timeout=10)
         response.encoding = 'utf-8'
+        response.raise_for_status()
     except Exception as e:
         print(f"❌ 请求主 JS 失败: {e}")
         return
 
     html_snippets = re.findall(r"document\.write\('(.*?)'\);", response.text)
     html_content = "".join(html_snippets)
-    
-    # 用正则快速切分比赛区块
-    ul_blocks = re.split(r'<ul class="item play', html_content)[1:]
-    
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    match_lists = soup.select('ul.item.play')
+    print(f"📊 成功解析 JS 文件，共找到 {len(match_lists)} 场比赛信息。")
+
     play_urls_to_visit = []
 
-    for block in ul_blocks:
-        time_match = re.search(r'<li class="lab_time">(.*?)</li>', block)
-        if not time_match:
+    # 2. 筛选比赛并进入详情页寻找“高清直播”
+    for match in match_lists:
+        time_li = match.find('li', class_='lab_time')
+        if not time_li:
             continue
-        time_str = time_match.group(1).strip()
         
+        time_str = time_li.get_text(strip=True)
         try:
             match_time_naive = datetime.strptime(f"{current_year}-{time_str}", "%Y-%m-%d %H:%M")
             match_time = tz.localize(match_time_naive)
+            
             if match_time > now + timedelta(days=300):
                 match_time = tz.localize(match_time_naive.replace(year=current_year - 1))
             elif match_time < now - timedelta(days=300):
@@ -55,19 +62,37 @@ def scrape_task():
 
         time_diff = (match_time - now).total_seconds() / 3600
         
-        # 筛选前后 3 小时
         if -3 <= time_diff <= 3:
-            # 找到含有“高清直播”的 data-play 链接
-            hd_matches = re.findall(r'data-play="(/play/[^"]+)"[^>]*>.*?高清直播', block)
-            for dp in hd_matches:
-                play_urls_to_visit.append(f"http://play.sportsteam368.com{dp}")
+            print(f"🕒 找到符合时间的比赛: {time_str}")
+            links = match.find_all('a', href=re.compile(r'play\.sportsteam368\.com'))
+            
+            for link in links:
+                match_url = link.get('href')
+                
+                try:
+                    # 请求详情页
+                    match_res = requests.get(match_url, headers=headers, timeout=10)
+                    match_res.encoding = 'utf-8'
+                    match_soup = BeautifulSoup(match_res.text, 'html.parser')
+                    
+                    # 在详情页中寻找“高清直播”
+                    hd_links = [a for a in match_soup.find_all('a') if a.get_text() and '高清直播' in a.get_text()]
 
+                    for hd in hd_links:
+                        data_play = hd.get('data-play')
+                        if data_play:
+                            play_url = f"http://play.sportsteam368.com{data_play}"
+                            play_urls_to_visit.append(play_url)
+                except Exception as e:
+                    print(f"   ❌ 请求详情页失败: {e}")
+
+    # 去重处理
     play_urls_to_visit = list(set(play_urls_to_visit))
-    print(f"📊 筛选出 {len(play_urls_to_visit)} 个需要在浏览器中打开的高清播放页。")
+    print(f"📊 筛选完毕，共有 {len(play_urls_to_visit)} 个需要在浏览器中拦截的【高清播放页】。")
 
     target_ids = set()
 
-    # 启动真实的浏览器内核
+    # 3. 启动无头浏览器进行资源请求抓包拦截
     if play_urls_to_visit:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -81,33 +106,30 @@ def scrape_task():
                 
                 captured_ids = []
 
-                # 【魔法核心】：监听浏览器的每一次资源请求（包括图片、JS、CSS、iframe等）
+                # 监听网络请求
                 def handle_request(request):
                     url = request.url
-                    # 我们知道目标 ID 是一长串 Base64 字符（超过 80 个字符，包含大小写字母数字和+/=）
-                    # 只要任何资源 URL 里面包含了这串特征，就直接提取出来！
+                    # 特征匹配：超过 80 位的连续 Base64 字符
                     match = re.search(r'([A-Za-z0-9+/=]{80,})', url)
                     if match:
                         extracted_id = match.group(1)
                         if extracted_id not in captured_ids:
                             captured_ids.append(extracted_id)
-                            # 为了让你看清它是从哪里抓出来的，打印一下 URL 的最后 30 个字符
                             source_file = url.split('?')[0][-30:] 
-                            print(f"   📡 [底层抓包] 成功抓到 ID: {extracted_id[:15]}... (隐蔽在: ...{source_file})")
+                            print(f"   📡 [底层抓包] 成功截获 ID: {extracted_id[:15]}... (源文件: ...{source_file})")
 
-                # 挂载网络监听器
                 page.on("request", handle_request)
 
                 try:
-                    # 等待页面加载，设置较短的超时时间，只要资源树开始请求 JS/CSS 就能抓到
+                    # 超时设置为 15 秒，只要底层资源开始请求就截获
                     page.goto(play_url, timeout=15000)
-                    page.wait_for_timeout(3000) # 给它 3 秒钟的时间加载周边资源
+                    page.wait_for_timeout(3000) # 多等3秒让 JS 加载图片和视频源
                 except Exception as e:
                     pass
                 finally:
                     page.close()
 
-                # 汇总抓到的 ID
+                # 合并到总池
                 for cid in captured_ids:
                     target_ids.add(cid)
 
@@ -130,7 +152,7 @@ scrape_task()
 def get_ids():
     if os.path.exists(FILE_PATH) and os.path.getsize(FILE_PATH) > 0:
         return send_file(FILE_PATH, mimetype='text/plain')
-    return "✅ 抓取任务已运行，但当前文件为空（前后3小时可能无比赛）。", 200
+    return "✅ 抓取任务运行完成，但当前文件为空（前后3小时可能无比赛）。", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
